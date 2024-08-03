@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     // 处理 -v 和 --version 参数
     if args.contains(&"-v".to_string()) || args.contains(&"--version".to_string()) {
-        info!("Downloader version 1.0.0");
+        info!("Downloader version: {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 

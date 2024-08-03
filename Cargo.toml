@@ -1,0 +1,15 @@
+[package]
+name = "vam_downloader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.39", features = ["full"] }
+reqwest = "0.12"
+anyhow = "1.0"
+tracing = "0.1"
+url = "2.5"
+serde_json = "1.0"
+tracing-subscriber = "0.3"
+http-downloader = { version = "0.3", features = ["status-tracker", "speed-limiter", "speed-tracker", "breakpoint-resume", "tracing", "bson-file-archiver"] }
+regex = "1.10"
