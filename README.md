@@ -8,7 +8,7 @@ This is a download plugin which is embedded in [github.com/bustesoul/varManager]
 
 ```powershell
 $CMD[powershell]
-.\vam_downloader.exe [URL] {[SAVE_DIR]
+.\vam_downloader.exe [URL] {[SAVE_DIR]}
     -h, --help      Show this help message
     -v, --version   Show version information
 ```
