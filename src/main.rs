@@ -17,6 +17,7 @@ use http_downloader::{
 use http_downloader::bson_file_archiver::{ArchiveFilePath, BsonFileArchiverBuilder};
 use http_downloader::speed_limiter::DownloadSpeedLimiterExtension;
 use regex::Regex;
+use percent_encoding::percent_decode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,9 +110,9 @@ async fn main() -> Result<()> {
     let head_response = client.head(&final_url).send().await?;
     let content_disposition = head_response.headers().get(header::CONTENT_DISPOSITION);
     let filename = if let Some(content_disposition) = content_disposition {
-        let content_disposition = content_disposition.to_str()?;
+        let content_disposition = percent_decode(content_disposition.as_bytes()).decode_utf8()?;
         let re = Regex::new(r#"filename="([^"]+)""#)?;
-        if let Some(captures) = re.captures(content_disposition) {
+        if let Some(captures) = re.captures(&content_disposition) {
             captures.get(1).map_or("default_filename".to_string(), |m| m.as_str().to_string())
         } else {
             "default_filename".to_string()
@@ -191,8 +192,14 @@ async fn main() -> Result<()> {
     // 重命名下载的文件
     let downloaded_file_path = save_dir.join(test_url.path().rsplit('/').next().unwrap());
     let new_file_path = save_dir.join(filename);
-    fs::rename(&downloaded_file_path, &new_file_path)?;
-    info!("File renamed to: {:?}", new_file_path);
-
-    Ok(())
+    match fs::rename(&downloaded_file_path, &new_file_path) {
+        Ok(_) => {
+            info!("File renamed to: {:?}", new_file_path);
+            Ok(())
+        }
+        Err(e) => {
+            error!("File rename failed: {:?}", e);
+            Err(anyhow::anyhow!("File rename failed: {:?}", e))
+        }
+    }
 }
