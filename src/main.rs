@@ -7,16 +7,14 @@ use anyhow::Result;
 use tracing::{info, error, warn};
 use url::Url;
 use reqwest::{Client, header};
-use http_downloader::{
-    HttpDownloaderBuilder,
-    speed_tracker::DownloadSpeedTrackerExtension,
-    status_tracker::DownloadStatusTrackerExtension,
-};
+use http_downloader::{HttpDownloaderBuilder, speed_tracker::DownloadSpeedTrackerExtension, status_tracker::DownloadStatusTrackerExtension, DownloadingEndCause};
 use http_downloader::speed_limiter::DownloadSpeedLimiterExtension;
 use regex::Regex;
 use percent_encoding::percent_decode;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use tokio::time::timeout;
 
 async fn download_file_task(
     url_to_download: String,
@@ -25,12 +23,13 @@ async fn download_file_task(
 ) -> Result<()> {
     info!("Starting download for: {}", url_to_download);
 
-    // 检查URL是否为空或者不是正确的http/https链接
+    // Validate URL
     if url_to_download.is_empty() || (!url_to_download.starts_with("http://") && !url_to_download.starts_with("https://")) {
-        error!("Error: Invalid URL '{}'. Please provide a valid http/https URL.", url_to_download);
+        error!("Invalid URL '{}'. Please provide a valid http/https URL.", url_to_download);
         return Err(anyhow::anyhow!("Invalid URL: {}. Must be http/https.", url_to_download));
     }
 
+    // Resolve final URL (handles redirects)
     let final_url_str = if url_to_download.ends_with(".data") {
         url_to_download.clone()
     } else {
@@ -63,91 +62,141 @@ async fn download_file_task(
         }
     };
 
-    let head_response = client.head(&final_url_str).send().await?;
-    let content_disposition_header = head_response.headers().get(header::CONTENT_DISPOSITION);
-    let filename = if let Some(cd_val) = content_disposition_header {
-        let cd_str = percent_decode(cd_val.as_bytes()).decode_utf8().unwrap_or_else(|_| "".into());
-        let re = Regex::new(r#"filename="?([^"]+)"?"#)?; // Made quote optional around filename
-        if let Some(captures) = re.captures(&cd_str) {
-            captures.get(1).map_or_else(
-                || Path::new(&final_url_str).file_name().map_or_else(|| "default_filename".to_string(), |name| name.to_string_lossy().into_owned()),
-                |m| m.as_str().to_string()
-            )
+    // Sanitize filename
+    let filename = {
+        let head_response = client.head(&final_url_str).send().await?;
+        let content_disposition = head_response.headers().get(header::CONTENT_DISPOSITION);
+
+        let mut extracted_filename = if let Some(cd_val) = content_disposition {
+            let cd_str = percent_decode(cd_val.as_bytes()).decode_utf8().unwrap_or_else(|_| "".into());
+            let re = Regex::new(r#"filename(?:\*)?=(?:"([^"]+)"|([^;\s]+))(?:;.*)?$"#)?;
+            if let Some(captures) = re.captures(&cd_str) {
+                captures.get(1).or(captures.get(2)).map(|m| m.as_str().to_string())
+                    .unwrap_or_else(|| "default_filename".to_string())
+            } else {
+                Path::new(&final_url_str)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "default_filename".to_string())
+            }
         } else {
-            Path::new(&final_url_str).file_name().map_or_else(|| "default_filename".to_string(), |name| name.to_string_lossy().into_owned())
+            Path::new(&final_url_str)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "default_filename".to_string())
+        };
+
+        extracted_filename = extracted_filename.trim_end_matches(';').to_string();
+        let invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+        for c in invalid_chars.iter() {
+            extracted_filename = extracted_filename.replace(*c, "_");
         }
-    } else {
-        Path::new(&final_url_str).file_name().map_or_else(|| "default_filename".to_string(), |name| name.to_string_lossy().into_owned())
+        if extracted_filename.is_empty() {
+            extracted_filename = "default_filename".to_string();
+        }
+        extracted_filename
     };
     info!("Resolved filename for {}: {}", final_url_str, filename);
 
     let download_url_obj = Url::parse(&final_url_str)?;
 
-    let (mut downloader, (status_state, speed_state, _speed_limiter, ..)) =
-        HttpDownloaderBuilder::new(download_url_obj.clone(), save_dir.clone())
-            .chunk_size(NonZeroUsize::new(1024 * 1024 * 10).unwrap())
-            .download_connection_count(NonZeroU8::new(4).unwrap()) // TODO: Make this configurable per download task if needed
-            .build((
-                DownloadStatusTrackerExtension { log: true },
-                DownloadSpeedTrackerExtension { log: true },
-                DownloadSpeedLimiterExtension::new(None),
-                // Breakpoint resume commented out
-            ));
+    // Download with retry logic
+    const MAX_RETRIES: u8 = 1;
+    let retry_count = AtomicU8::new(0);
+    let download_result = loop {
+        let attempt = retry_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = timeout(Duration::from_secs(300), async {
+            let (mut downloader, (_status_state, _speed_state, _speed_limiter, ..)) =
+                HttpDownloaderBuilder::new(download_url_obj.clone(), save_dir.clone())
+                    .chunk_size(NonZeroUsize::new(1024 * 1024 * 10).unwrap())
+                    .download_connection_count(NonZeroU8::new(4).unwrap())
+                    .build((
+                        DownloadStatusTrackerExtension { log: true },
+                        DownloadSpeedTrackerExtension { log: true },
+                        DownloadSpeedLimiterExtension::new(None),
+                    ));
 
-    info!("[{}] Prepare download", filename);
-    let download_future = downloader.prepare_download()?;
+            info!("[{}] Prepare download (attempt {})", filename, attempt);
+            let download_future = downloader.prepare_download()
+                .map_err(|e| anyhow::anyhow!("Failed to prepare download: {}", e))?;
 
-    let _status = status_state.status();
-    let _status_receiver = status_state.status_receiver;
-    let _byte_per_second = speed_state.download_speed();
-    let _speed_receiver = speed_state.receiver;
+            let progress_handle = tokio::spawn({
+                let mut downloaded_len_receiver = downloader.downloaded_len_receiver().clone();
+                let total_size_future = downloader.total_size_future();
+                let p_filename = filename.clone();
+                async move {
+                    let total_len = total_size_future.await;
+                    if let Some(total_len) = total_len {
+                        if total_len.get() > 0 {
+                            info!("[{}] Total size: {:.2} Mb", p_filename, total_len.get() as f64 / 1024_f64 / 1024_f64);
+                        } else {
+                            info!("[{}] Total size: 0 bytes or unknown", p_filename);
+                        }
+                    }
+                    while downloaded_len_receiver.changed().await.is_ok() {
+                        let progress = *downloaded_len_receiver.borrow();
+                        if let Some(total_len) = total_len {
+                            if total_len.get() > 0 {
+                                info!("[{}] Progress: {} % ({}/{} bytes)", p_filename, progress * 100 / total_len, progress, total_len);
+                            } else if progress > 0 {
+                                info!("[{}] Progress: {} bytes (total size 0 or unknown)", p_filename, progress);
+                            }
+                        } else {
+                            info!("[{}] Progress: {} bytes (total size unknown)", p_filename, progress);
+                        }
+                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                    }
+                }
+            });
 
-    let progress_handle = tokio::spawn({
-        let mut downloaded_len_receiver = downloader.downloaded_len_receiver().clone();
-        let total_size_future = downloader.total_size_future();
-        let p_filename = filename.clone();
-        async move {
-            let total_len = total_size_future.await;
-            if let Some(total_len) = total_len {
-                if total_len.get() > 0 { // Avoid division by zero if total_len is 0
-                    info!("[{}] Total size: {:.2} Mb", p_filename, total_len.get() as f64 / 1024_f64 / 1024_f64);
+            info!("[{}] Start downloading until the end (attempt {})", filename, attempt);
+            let dec = download_future.await
+                .map_err(|e| anyhow::anyhow!("Download failed: {}", e))?;
+            progress_handle.abort();
+            Ok::<DownloadingEndCause, anyhow::Error>(dec)
+        }).await;
+
+        match result {
+            Ok(Ok(dec)) => break Ok(dec),
+            Ok(Err(e)) => {
+                if attempt <= MAX_RETRIES && e.to_string().to_lowercase().contains("error sending request") {
+                    warn!("[{}] Download failed: {}. Retrying (attempt {}/{})", filename, e, attempt +1 , MAX_RETRIES +1); // attempt is already incremented for next
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 } else {
-                    info!("[{}] Total size: 0 bytes or unknown", p_filename);
+                    error!("[{}] Download failed after {} attempts: {}", filename, attempt, e);
+                    break Err(e);
                 }
             }
-            while downloaded_len_receiver.changed().await.is_ok() {
-                let progress = *downloaded_len_receiver.borrow();
-                if let Some(total_len) = total_len {
-                    if total_len.get() > 0 {
-                         info!("[{}] Progress: {} % ({}/{} bytes)", p_filename, progress * 100 / total_len, progress, total_len);
-                    } else if progress > 0 { // If total_len is 0 but we have progress
-                         info!("[{}] Progress: {} bytes (total size 0 or unknown)", p_filename, progress);
-                    }
-                } else { // If total_len is None
-                    info!("[{}] Progress: {} bytes (total size unknown)", p_filename, progress);
+            Err(_) => {
+                if attempt <= MAX_RETRIES {
+                    warn!("[{}] Download timed out. Retrying (attempt {}/{})", filename, attempt + 1, MAX_RETRIES + 1);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                } else {
+                    error!("[{}] Download timed out after {} attempts", filename, attempt);
+                    break Err(anyhow::anyhow!("Download timed out after {} attempts", attempt));
                 }
-                tokio::time::sleep(Duration::from_millis(1000)).await;
             }
         }
-    });
+    };
 
-    // Speed limiter task (currently does nothing as change_speed is commented out)
-    // tokio::spawn(async move {
-    //     tokio::time::sleep(Duration::from_secs(2)).await;
-    // });
-
-    info!("[{}] Start downloading until the end", filename);
-    let dec = download_future.await?;
+    let dec = download_result?;
     info!("[{}] Downloading end cause: {:?}", filename, dec);
 
-    progress_handle.abort(); // Stop progress printing once download is complete or failed
-
+    // Verify and rename file
     let downloaded_file_path = save_dir.join(download_url_obj.path_segments().and_then(|s| s.last()).unwrap_or("unknown_temp_file"));
     let new_file_path = save_dir.join(&filename);
 
     if downloaded_file_path == new_file_path {
         info!("[{}] File already at target location: {:?}", filename, new_file_path);
     } else if downloaded_file_path.exists() {
+        let file_size = fs::metadata(&downloaded_file_path)?.len();
+        if file_size == 0 {
+            error!("[{}] Downloaded file is empty: {:?}", filename, downloaded_file_path);
+            return Err(anyhow::anyhow!("Downloaded file {} is empty", filename));
+        }
+
         match fs::rename(&downloaded_file_path, &new_file_path) {
             Ok(_) => info!("[{}] File renamed to: {:?}", filename, new_file_path),
             Err(e) => {
@@ -156,12 +205,20 @@ async fn download_file_task(
             }
         }
     } else {
-         warn!("[{}] Expected downloaded file not found at {:?}. It might have been saved directly as {:?}", filename, downloaded_file_path, new_file_path);
-         if !new_file_path.exists() {
-            error!("[{}] Final file {:?} also not found. Download may have failed silently or saved elsewhere.", filename, new_file_path);
+        warn!("[{}] Expected downloaded file not found at {:?}. Checking target location {:?}", filename, downloaded_file_path, new_file_path);
+        if !new_file_path.exists() {
+            error!("[{}] Final file {:?} not found. Download may have failed silently.", filename, new_file_path);
             return Err(anyhow::anyhow!("Final file {} not found after download.", filename));
-         }
+        } else {
+            let file_size = fs::metadata(&new_file_path)?.len();
+            if file_size == 0 {
+                error!("[{}] Downloaded file at target location is empty: {:?}", filename, new_file_path);
+                return Err(anyhow::anyhow!("Downloaded file {} is empty", filename));
+            }
+            info!("[{}] File found at target location: {:?}", filename, new_file_path);
+        }
     }
+
     Ok(())
 }
 
