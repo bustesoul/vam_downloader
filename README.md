@@ -18,3 +18,18 @@ $CMD[powershell]
     -h, --help:              Show this help message
     -v, --version:           Show version information
 ```
+
+## Main Features
+
+* **Batch Download**: Support batch download from a single URL, local text file (one URL per line) or remote JSON list URL.
+* **Concurrent Download**: You can specify the number of files to download simultaneously via `--concurrent` or `-c` parameter, the default is 3.
+* **Progress Display**:
+  * When downloading multiple files, a separate progress bar will be displayed for each concurrent download task.
+  * Clearly display the download progress, downloaded size and total size of each file.
+* **Logging**:
+  * Detailed download process logs are automatically saved to the `vam_downloader.log` file in the specified download directory (default is `./downloaded_files`).
+  * Log files are rotated daily.
+* **Smart Filename Parsing**: Try to extract and clean file names from the `Content-Disposition` HTTP header or URL path.
+* **Error Handling and Retry**:
+  * Automatically retry certain retryable errors (such as connection problems, timeouts) during network requests and downloads.
+  * After downloading is complete, it will check whether the file is empty.
