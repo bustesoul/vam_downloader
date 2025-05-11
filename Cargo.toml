@@ -1,11 +1,11 @@
 [package]
 name = "vam_downloader"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1.39", features = ["full"] }
-reqwest = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1.0"
 tracing = "0.1"
 url = "2.5"

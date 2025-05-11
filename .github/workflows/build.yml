@@ -49,7 +49,7 @@ jobs:
           CARGO_TERM_COLOR: always
 
       - name: Upload Release
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: vam_downloader
           path: artifacts/vam_downloader.exe
