@@ -24,6 +24,7 @@ async fn download_file_task(
     save_dir: PathBuf,
     client: Arc<Client>,
     pb: Arc<ProgressBar>,
+    skip_head: bool,
 ) -> Result<()> {
     info!("Starting download for: {}", url_to_download);
 
@@ -99,36 +100,58 @@ async fn download_file_task(
     };
 
     let filename = {
-        let head_response = match client.head(&final_url_str).send().await {
-            Ok(resp) => {
-                info!("HEAD request for {} returned status: {}", final_url_str, resp.status());
-                resp
-            }
-            Err(e) => {
-                error!("Failed to send HEAD request for {}: {}", final_url_str, e);
-                pb.finish_with_message(format!("Download of {} failed: HEAD request error: {}", final_url_str, e));
-                return Err(anyhow::anyhow!("Failed to send HEAD request for {}: {}", final_url_str, e));
-            }
-        };
-        let content_disposition = head_response.headers().get(header::CONTENT_DISPOSITION);
-
-        let mut extracted_filename = if let Some(cd_val) = content_disposition {
-            let cd_str = percent_decode(cd_val.as_bytes()).decode_utf8().unwrap_or_else(|_| "".into());
-            let re = Regex::new(r#"filename(?:\*)?=(?:"([^"]+)"|([^;\s]+))(?:;.*)?$"#)?;
-            if let Some(captures) = re.captures(&cd_str) {
-                captures.get(1).or(captures.get(2)).map(|m| m.as_str().to_string())
-                    .unwrap_or_else(|| "default_filename".to_string())
-            } else {
-                Path::new(&final_url_str)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "default_filename".to_string())
-            }
+        let mut extracted_filename = if skip_head {
+            // Skip HEAD request, extract filename from URL
+            info!("Skipping HEAD request for {}, extracting filename from URL", final_url_str);
+            let url_path = Url::parse(&final_url_str).ok()
+                .and_then(|u| u.path_segments().and_then(|s| s.last().map(|s| s.to_string())));
+            url_path.unwrap_or_else(|| "default_filename".to_string())
         } else {
-            Path::new(&final_url_str)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "default_filename".to_string())
+            // HEAD request with retry logic
+            const MAX_HEAD_RETRIES: u8 = 3;
+            let head_retry_count = AtomicU8::new(0);
+            let head_result: Result<Option<String>> = loop {
+                let attempt = head_retry_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let result = client.head(&final_url_str).send().await;
+
+                match result {
+                    Ok(resp) => {
+                        info!("HEAD request for {} returned status: {}", final_url_str, resp.status());
+                        let content_disposition = resp.headers().get(header::CONTENT_DISPOSITION).cloned();
+                        break Ok(content_disposition.and_then(|cd_val| {
+                            let cd_str = percent_decode(cd_val.as_bytes()).decode_utf8().unwrap_or_else(|_| "".into());
+                            let re = Regex::new(r#"filename(?:\*)?=(?:"([^"]+)"|([^;\s]+))(?:;.*)?$"#).ok()?;
+                            re.captures(&cd_str).and_then(|captures| {
+                                captures.get(1).or(captures.get(2)).map(|m| m.as_str().to_string())
+                            })
+                        }));
+                    }
+                    Err(e) => {
+                        let is_retryable = e.is_connect() || e.is_timeout() || e.is_request();
+                        if attempt <= MAX_HEAD_RETRIES && is_retryable {
+                            warn!("HEAD request for {} failed: {}. Retrying (attempt {}/{})", final_url_str, e, attempt + 1, MAX_HEAD_RETRIES + 1);
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        } else {
+                            error!("HEAD request for {} failed after {} attempts: {}", final_url_str, attempt, e);
+                            pb.finish_with_message(format!("Download of {} failed: HEAD request error: {}", final_url_str, e));
+                            break Err(anyhow::anyhow!("Failed to send HEAD request for {}: {}", final_url_str, e));
+                        }
+                    }
+                }
+            };
+
+            match head_result {
+                Ok(Some(name)) => name,
+                Ok(None) => {
+                    // No Content-Disposition, extract from URL
+                    Path::new(&final_url_str)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "default_filename".to_string())
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         extracted_filename = extracted_filename.trim_end_matches(';').to_string();
@@ -377,11 +400,12 @@ async fn main() -> Result<()> {
     let all_args: Vec<String> = env::args().collect();
 
     if all_args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        eprintln!("Usage: {} [URL_OR_FILE_OR_JSON_URL] [SAVE_DIR] [--concurrent <NUM>] [-c <NUM>]", all_args.get(0).map_or("downloader", |s| s.as_str()));
+        eprintln!("Usage: {} [URL_OR_FILE_OR_JSON_URL] [SAVE_DIR] [--concurrent <NUM>] [-c <NUM>] [--skip-head] [-s]", all_args.get(0).map_or("downloader", |s| s.as_str()));
         eprintln!("Arguments:");
         eprintln!("\tURL_OR_FILE_OR_JSON_URL: Single HTTP/HTTPS URL, path to a local file with HTTP/HTTPS URLs (one per line), or an HTTP/HTTPS URL to a JSON list of HTTP/HTTPS URLs.");
         eprintln!("\tSAVE_DIR (optional): Directory to save downloaded files. Defaults to './downloaded_files'.");
-        eprintln!("\t--concurrent <NUM> or -c <NUM> (optional): Number of concurrent downloads. Defaults to 2. Must be > 0.");
+        eprintln!("\t--concurrent <NUM> or -c <NUM> (optional): Number of concurrent downloads. Defaults to 3. Must be > 0.");
+        eprintln!("\t--skip-head or -s (optional): Skip HEAD request, extract filename from URL directly. Useful when HEAD requests fail or are slow.");
         eprintln!("\t-h, --help\tShow this help message");
         eprintln!("\t-v, --version\tShow version information");
         return Ok(());
@@ -395,6 +419,7 @@ async fn main() -> Result<()> {
     let mut concurrent_downloads: usize = 3; // Reduced default concurrency
     let mut url_input_str: Option<String> = None;
     let mut save_dir_str: Option<String> = None;
+    let mut skip_head: bool = false;
 
     // Parse command-line arguments
     let mut positional_arg_index = 0;
@@ -410,6 +435,8 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("--concurrent option requires a value, using default {}.", concurrent_downloads);
             }
+        } else if arg == "--skip-head" || arg == "-s" {
+            skip_head = true;
         } else if !arg.starts_with('-') {
             if positional_arg_index == 0 {
                 url_input_str = Some(arg.clone());
@@ -490,8 +517,9 @@ async fn main() -> Result<()> {
         );
         let pb = Arc::new(pb);
         let url_str_clone = url_str.clone();
+        let skip_head_clone = skip_head;
         let task = tokio::spawn(async move {
-            let download_result = download_file_task(url_str_clone, save_dir_clone, client_clone, pb).await;
+            let download_result = download_file_task(url_str_clone, save_dir_clone, client_clone, pb, skip_head_clone).await;
             drop(permit);
             download_result
         });
